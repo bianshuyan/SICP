@@ -45,6 +45,7 @@
 (define line (draw-line canvas))
 
 ;lines接受相对坐标的线的表，产生画家
+;亦可以使用for-each
 (define ((lines lst) f)
   (let ((m (cmap f)))
     (define (iter rest)
