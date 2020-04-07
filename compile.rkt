@@ -1,4 +1,5 @@
 #lang racket
+(require racket/fixnum)
 (define-syntax match
   (syntax-rules (else guard)
     ((_ v) (error 'match "~s" v))
@@ -18,7 +19,7 @@
          (let ((vx (car v)) (vy (cdr v)))
            (ppat vx x (ppat vy y kt kf) kf))
          kf))
-    ((_ v lit kt kf) (if (equal? v (quote lit)) kt kf))))
+    ((_ v lit kt kf) (if (eq? v (quote lit)) kt kf))))
 (define (target-fixnum? x)
   (and (integer? x)
        (exact? x)
@@ -32,6 +33,13 @@
                (cond ((= len i) #t)
                      ((datum? (vector-ref x i)) (loop (+ i 1)))
                      (else #f)))))))
+(define (compose2 f g)
+  (lambda (x)
+    (f (g x))))
+(define-syntax compose
+  (syntax-rules ()
+    ((_ f) f)
+    ((_ f g ...) (compose2 f (compose g ...)))))
 (define counter
   (let ((n 0))
     (lambda ()
@@ -40,6 +48,34 @@
 (define (unique-symbol x)
   (string->symbol
    (format "~a.~s" x (counter))))
+(define (unique-label x)
+  (string->symbol
+   (format "~a$~s" x (counter))))
+(define label?
+  (lambda (x)
+    (and (symbol? x)
+         (let* ([s (symbol->string x)] [n (string-length s)])
+           (define (s0 i)
+             (and (not (fx= i -1))
+                  (cond
+                    [(char<=? #\0 (string-ref s i) #\9) (s1 (fx- i 1))]
+                    [else #f])))
+           (define (s1 i)
+             (and (not (fx= i -1))
+                  (let ([c (string-ref s i)])
+                    (cond
+                      [(char<=? #\1 (string-ref s i) #\9) (s1 (fx- i 1))]
+                      [(char=? c #\$) #t]
+                      [(char=? c #\0) (s2 (fx- i 1))]
+                      [else #f]))))
+           (define (s2 i)
+             (and (not (fx= i -1))
+                  (let ([c (string-ref s i)])
+                    (cond
+                      [(char<=? #\1 (string-ref s i) #\9) (s1 (fx- i 1))]
+                      [(char=? c #\0) (s2 (fx- i 1))]
+                      [else #f]))))
+           (s0 (fx- n 1))))))
 (define (set? x)
   (cond ((null? x) #t)
         ((memq (car x) (cdr x)) #f)
@@ -60,6 +96,15 @@
   (cond ((null? s1) '())
         ((memq (car s1) s2) (D (cdr s1) s2))
         (else (cons (car s1) (D (cdr s1) s2)))))
+(define (make-begin exps)
+  (define (flatten exp)
+    (match exp
+      ((begin . ,exps) (apply append (map flatten exps)))
+      (else (list exp))))
+  (let ((exps (apply append (map flatten exps))))
+    (if (null? (cdr exps))
+        (car exps)
+        (cons 'begin exps))))
 (define (: bds k)
   (k (map car bds) (map cadr bds)))
 (define (Let x* e* body)
@@ -109,9 +154,9 @@
           (else (error 'parse-scheme "unbound variable ~s" var))))
   (define (make-body exps env)
     (cond ((null? exps) (error 'parse-scheme "empty begin body"))
-          ((null? (cdr exps)) ((parse0 env) (car exps)))
-          (else (cons 'begin (map (parse0 env) exps)))))
-  (define (parse0 env)
+          ((null? (cdr exps)) ((parse env) (car exps)))
+          (else (cons 'begin (map (parse env) exps)))))
+  (define (parse env)
     (lambda (exp)
       (match exp
         (,n (guard (number? n)) (if (target-fixnum? n)
@@ -123,33 +168,33 @@
                                (let ((a (assq rator env)))
                                  (if a
                                      (let ((rator (cdr a))
-                                           (rands (map (parse0 env) rands)))
+                                           (rands (map (parse env) rands)))
                                        (if (eq? rator 'not)
                                            `(if ,(car rands) '#f '#t)
                                            (cons rator rands)))
-                                     ((parse1 env) exp)))
-                               (map (parse0 env) exp)))
+                                     ((parse-form env) exp)))
+                               (map (parse env) exp)))
         (else (error 'parse-scheme "invalid input ~s" exp)))))
-  (define (parse1 env)
+  (define (parse-form env)
     (lambda (exp)
       (match exp
         ((quote ,d) (if (datum? d)
                         exp
                         (error 'parse-scheme "invalid datum ~s" d)))
-        ((if ,q ,a) `(if ,((parse0 env) q) ,((parse0 env) a) (void)))
-        ((if ,q ,a ,e) `(if ,((parse0 env) q) ,((parse0 env) a) ,((parse0 env) e)))
-        ((set! ,x ,e) `(set! ,(lookup x env) ,((parse0 env) e)))
+        ((if ,q ,a) `(if ,((parse env) q) ,((parse env) a) (void)))
+        ((if ,q ,a ,e) `(if ,((parse env) q) ,((parse env) a) ,((parse env) e)))
+        ((set! ,x ,e) `(set! ,(lookup x env) ,((parse env) e)))
         ((begin . ,exps) (make-body exps env))
         ((and . ,exps) (if (null? exps)
                            ''#t
-                           (let ((exps (map (parse0 env) exps)))
+                           (let ((exps (map (parse env) exps)))
                              (let loop ((exp (car exps)) (exps (cdr exps)))
                                (if (null? exps)
                                    exp
                                    `(if ,exp ,(loop (car exps) (cdr exps)) '#f))))))
         ((or . ,exps) (if (null? exps)
                           ''#f
-                          (let ((exps (map (parse0 env) exps)))
+                          (let ((exps (map (parse env) exps)))
                             (let loop ((exp (car exps)) (exps (cdr exps)))
                               (if (null? exps)
                                   exp
@@ -170,7 +215,7 @@
                 (error 'parse-scheme "invalid let LHS vars ~s" x*))
               (let* ((x*^ (map unique-symbol x*))
                      (env^ (append (map cons x* x*^) env))
-                     (e* (map (parse0 env) e*))
+                     (e* (map (parse env) e*))
                      (body (make-body exps env^)))
                 (Let x*^ e* body)))))
         ((letrec ,bds . ,exps)
@@ -180,11 +225,11 @@
                 (error 'parse-scheme "invalid letrec LHS vars ~s" x*))
               (let* ((x*^ (map unique-symbol x*))
                      (env^ (append (map cons x* x*^) env))
-                     (e* (map (parse0 env^) e*))
+                     (e* (map (parse env^) e*))
                      (body (make-body exps env^)))
                 (Letrec x*^ e* body)))))
         (else (error 'parse-scheme "unbound variable ~s" (car exp))))))
-  ((parse0 prim-env) x))
+  ((parse prim-env) x))
 (define (convert-complex-datum x)
   (define (convert-datum x)
     (cond ((pair? x) (list 'cons (convert-datum (car x)) (convert-datum (cdr x))))
@@ -333,6 +378,10 @@
       (else (map purify exp))))
   (purify x))
 (define (convert-assignments x)
+  (define (Let x* e* body)
+    (if (null? x*)
+        body
+        (list 'let (map list x* e*) body)))
   (define (convert env)
     (lambda (exp)
       (match exp
@@ -461,3 +510,175 @@
               (Letrec x* e* body)))))
       (else (map sanitize exp))))
   (sanitize x))
+(define compile0
+  (compose sanitize-binding-forms
+           remove-anonymous-lambda
+           optimize-direct-call
+           convert-assignments
+           purify-letrec
+           uncover-assigned
+           convert-complex-datum
+           parse-scheme))
+(define (uncover-free x)
+  (define (uncover-exps exps)
+    (if (null? exps)
+        (values '() '())
+        (let-values (((a f*0) (uncover (car exps)))
+                     ((d f*1) (uncover-exps (cdr exps))))
+          (values (cons a d) (U f*0 f*1)))))
+  (define (uncover exp)
+    (match exp
+      ((quote ,d) (values exp '()))
+      (,x (guard (symbol? x)) (values x (if (prim? x) '() (list x))))
+      ((if ,q ,a ,e) (let-values (((q f*0) (uncover q))
+                                  ((a f*1) (uncover a))
+                                  ((e f*2) (uncover e)))
+                       (values `(if ,q ,a ,e) (U f*0 (U f*1 f*2)))))
+      ((begin . ,exps) (let-values (((exps f*) (uncover-exps exps)))
+                         (values (cons 'begin exps) f*)))
+      ((lambda ,x* ,body) (let-values (((body f*) (uncover body)))
+                            (let ((f* (D f* x*)))
+                              (values `(lambda ,x* (free ,f* ,body)) f*))))
+      ((let ,bds ,body)
+       (: bds
+          (lambda (x* e*)
+            (let-values (((e* f*0) (uncover-exps e*))
+                         ((body f*1) (uncover body)))
+              (values (Let x* e* body) (U f*0 (D f*1 x*)))))))
+      ((letrec ,bds ,body)
+       (: bds
+          (lambda (x* e*)
+            (let-values (((e* f*0) (uncover-exps e*))
+                         ((body f*1) (uncover body)))
+              (values (Letrec x* e* body) (D (U f*0 f*1) x*))))))
+      (else (uncover-exps exp))))
+  (let-values (((x f*) (uncover x)))
+    (if (null? f*)
+        x
+        (error 'uncover-free "uncaptured free variables ~s" f*))))
+(define (convert-closures x)
+  (define (convert exp)
+    (match exp
+      ((quote ,d) exp)
+      (,x (guard (symbol? x)) x)
+      ((if ,q ,a ,e) `(if ,(convert q) ,(convert a) ,(convert e)))
+      ((begin . ,exps) (cons 'begin (map convert exps)))
+      ((let ,bds ,body)
+       (: bds
+          (lambda (x* e*)
+            (let ((e* (map convert e*))
+                  (body (convert body)))
+              (Let x* e* body)))))
+      ((letrec ,bds ,body)
+       (: bds
+          (lambda (x* e*)
+            (let ((l* (map (lambda (x) (unique-label 'l)) x*))
+                  (cp* (map (lambda (x) (unique-symbol 'cp)) x*)))
+              (let ((e* (map (lambda (e cp)
+                               (match e
+                                 ((lambda ,x* (free ,f* ,body))
+                                  `(lambda ,(cons cp x*) (free ,f* ,(convert body)))))) e* cp*))
+                    (f** (map (lambda (e)
+                                (match e
+                                  ((lambda ,x* (free ,f* ,body)) f*))) e*)))
+                (Letrec l* e*
+                        `(closures ,(map list x* l* f**) ,(convert body))))))))
+      (else (let ((exp (map convert exp)))
+              (let ((rator (car exp)) (rands (cdr exp)))
+                (if (symbol? rator)
+                    (if (prim? rator)
+                        (cons rator rands)
+                        (cons rator (cons rator rands)))
+                    (let ((t (unique-symbol 't)))
+                      `(let ((,t ,rator))
+                         (,t ,t . ,rands)))))))))
+  (convert x))
+(define (optimize-known-call x)
+  (define (optimize env)
+    (lambda (exp)
+      (match exp
+        ((quote ,d) exp)
+        (,x (guard (symbol? x)) x)
+        ((if ,q ,a ,e) `(if ,((optimize env) q)
+                            ,((optimize env) a)
+                            ,((optimize env) e)))
+        ((begin . ,exps) (cons 'begin (map (optimize env) exps)))
+        ((let ,bds ,body)
+         (: bds
+            (lambda (x* e*)
+              (let ((e* (map (optimize env) e*))
+                    (body ((optimize env) body)))
+                (Let x* e* body)))))
+        ((letrec ,bds (closures ,c* ,body))
+         (: bds
+            (lambda (l* e*)
+              (let* ((x* (map car c*))
+                     (env (append (map cons x* l*) env))
+                     (e* (map (lambda (e)
+                                (match e
+                                  ((lambda ,x* (free ,f* ,body))
+                                   `(lambda ,x* (free ,f* ,((optimize env) body)))))) e*))
+                     (body ((optimize env) body)))
+                (Letrec l* e* `(closures ,c* ,body))))))
+        ((,rator . ,rands)
+         (let ((rator (cond ((assq rator env) => cdr)
+                            (else rator)))
+               (rands (map (optimize env) rands)))
+           (cons rator rands))))))
+  ((optimize '()) x))
+(define (introduce-procedure-primitives x)
+  (define (lookup x cp f*)
+    (let loop ((f* f*) (i 0))
+      (cond ((null? f*) x)
+            ((eq? (car f*) x) `(closure-ref ,cp (quote ,i)))
+            (else (loop (cdr f*) (+ i 1))))))
+  (define (build-set!s c cp f*)
+    (let ((x (car c)) (f* (map (intro cp f*) (caddr c))))
+      (let loop ((f* f*) (i 0) (result '()))
+        (if (null? f*)
+            (reverse result)
+            (loop (cdr f*) (+ i 1)
+                  (cons `(closure-set! ,x (quote ,i) ,(car f*)) result))))))
+  (define (intro cp f*)
+    (lambda (exp)
+      (match exp
+        ((quote ,d) exp)
+        (,x (guard (symbol? x)) (lookup x cp f*)) ;x may be a label or prim
+        ((if ,q ,a ,e) `(if ,((intro cp f*) q)
+                            ,((intro cp f*) a)
+                            ,((intro cp f*) e)))
+        ((begin . ,exps) (cons 'begin (map (intro cp f*) exps)))
+        ((let ,bds ,body)
+         (: bds
+            (lambda (x* e*)
+              (let ((e* (map (intro cp f*) e*))
+                    (body ((intro cp f*) body)))
+                (Let x* e* body)))))
+        ((letrec ,bds (closures ,c* ,body))
+         (: bds
+            (lambda (l* e*)
+              (let ((set!s (apply append (map (lambda (c) (build-set!s c cp f*)) c*)))
+                    (closure-bds (map (lambda (c)
+                                        (let ((x (car c)) (l (cadr c)) (f* (caddr c)))
+                                          `(,x (make-closure ,l (quote ,(length f*)))))) c*))
+                    (e* (map (lambda (e)
+                               (match e
+                                 ((lambda ,x* (free ,f* ,body))
+                                  (let ((cp (car x*)))
+                                    `(lambda ,x* ,((intro cp f*) body)))))) e*))
+                    (body ((intro cp f*) body)))
+                (Letrec l* e* `(let ,closure-bds ,(make-begin (append set!s (list body)))))))))
+        ((,rator . ,rands)
+         (let ((rator (cond ((prim? rator) rator)
+                            ((label? rator) rator)
+                            (else `(closure-code ,(lookup rator cp f*)))))
+               (rands (map (intro cp f*) rands)))
+           (cons rator rands))))))
+  ((intro #f '()) x))
+(define test
+  (compose pretty-print
+           introduce-procedure-primitives
+           optimize-known-call
+           convert-closures
+           uncover-free
+           compile0))
